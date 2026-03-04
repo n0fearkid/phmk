@@ -22,27 +22,22 @@ MAX_PER_SLOT = 10
 DELETE_DELAY = 8  # секунд до удаления сообщений бота
 
 # ==================== РАСПИСАНИЕ ====================
-# Четная неделя: Пн 16:00, Пт 16:30, Сб 14:00
-# Нечетная неделя: Пн 17:30, Пт 16:30, Сб 14:00
+# weekday: 0=Пн, 1=Вт, 2=Ср, 3=Чт, 4=Пт, 5=Сб, 6=Вс
+# parity: "even" = чётная неделя, "odd" = нечётная
 
-EVEN_SLOTS = [
-    {"day": "Пн", "time": "16:00", "weekday": 0},
-    {"day": "Пт", "time": "16:30", "weekday": 4},
-    {"day": "Сб", "time": "14:00", "weekday": 5},
-]
-
-ODD_SLOTS = [
-    {"day": "Пн", "time": "17:30", "weekday": 0},
-    {"day": "Пт", "time": "16:30", "weekday": 4},
-    {"day": "Сб", "time": "14:00", "weekday": 5},
+SCHEDULE = [
+    {"day": "Пн", "time": "16:00", "weekday": 0, "parity": "even"},
+    {"day": "Пт", "time": "16:30", "weekday": 4, "parity": "even"},
+    {"day": "Сб", "time": "14:00", "weekday": 5, "parity": "even"},
+    {"day": "Пн", "time": "17:30", "weekday": 0, "parity": "odd"},
+    {"day": "Пт", "time": "16:30", "weekday": 4, "parity": "odd"},
+    {"day": "Сб", "time": "14:00", "weekday": 5, "parity": "odd"},
 ]
 
 # ==================== СОСТОЯНИЯ ====================
 user_states = {}
 user_states_lock = threading.Lock()
 
-# Хранит последнее сообщение бота для каждого peer_id
-# чтобы НЕ удалять его (удаляем только предпоследние)
 last_bot_msg = {}
 last_bot_msg_lock = threading.Lock()
 
@@ -103,72 +98,77 @@ def db_execute(query, params=(), fetch=False, fetchone=False):
     return result
 
 
-# ==================== SLOT HELPERS ====================
-def is_even_week():
-    now = datetime.datetime.now()
-    week_num = now.isocalendar()[1]
-    return week_num % 2 == 0
+# ==================== SLOT ENGINE ====================
+def get_week_parity(date_obj):
+    """Возвращает 'even' или 'odd' для даты."""
+    week_num = date_obj.isocalendar()[1]
+    return "even" if week_num % 2 == 0 else "odd"
 
 
-def get_current_week_type():
-    return "even" if is_even_week() else "odd"
-
-
-def get_current_slots():
-    if is_even_week():
-        return EVEN_SLOTS
-    else:
-        return ODD_SLOTS
-
-
-def get_available_slots():
+def get_next_n_slots(n=SLOTS_TO_SHOW):
     """
-    Возвращает только БУДУЩИЕ слоты текущей недели.
-    Прошедшие даты/время отфильтровываются.
+    Находит N ближайших БУДУЩИХ занятий от текущего момента.
+    Перебирает дни вперёд, проверяет расписание и чётность недели.
+    Возвращает список словарей с date, datetime, day, time, slot_key.
     """
     now = datetime.datetime.now()
     today = now.date()
-    current_weekday = today.weekday()
-
-    slots = get_current_slots()
     result = []
-    for slot in slots:
-        diff = slot["weekday"] - current_weekday
-        slot_date = today + datetime.timedelta(days=diff)
-
-        # Парсим время слота
-        hour, minute = map(int, slot["time"].split(':'))
-        slot_datetime = datetime.datetime.combine(slot_date, datetime.time(hour, minute))
-
-        # Пропускаем прошедшие
-        if slot_datetime < now:
-            continue
-
-        result.append({
-            "day": slot["day"],
-            "time": slot["time"],
-            "weekday": slot["weekday"],
-            "date": slot_date,
-            "datetime": slot_datetime,
-        })
+    
+    # Перебираем до 60 дней вперёд (хватит с запасом)
+    for days_ahead in range(0, 60):
+        check_date = today + datetime.timedelta(days=days_ahead)
+        check_weekday = check_date.weekday()
+        check_parity = get_week_parity(check_date)
+        
+        # Ищем слоты на этот день
+        for slot in SCHEDULE:
+            if slot["weekday"] != check_weekday:
+                continue
+            if slot["parity"] != check_parity:
+                continue
+            
+            # Собираем datetime слота
+            hour, minute = map(int, slot["time"].split(':'))
+            slot_dt = datetime.datetime.combine(
+                check_date, datetime.time(hour, minute)
+            )
+            
+            # Пропускаем прошедшие
+            if slot_dt <= now:
+                continue
+            
+            slot_key = f"{check_parity}_{slot['day']}_{slot['time']}_{check_date.isoformat()}"
+            
+            result.append({
+                "day": slot["day"],
+                "time": slot["time"],
+                "date": check_date,
+                "datetime": slot_dt,
+                "slot_key": slot_key,
+                "parity": check_parity,
+            })
+            
+            if len(result) >= n:
+                return result
+    
     return result
-
-
-def make_slot_key(slot_info):
-    """Ключ слота: 'even_Пн_16:00_2025-01-15'"""
-    week_type = get_current_week_type()
-    return f"{week_type}_{slot_info['day']}_{slot_info['time']}_{slot_info['date'].isoformat()}"
 
 
 def parse_slot_display(slot_key):
     """Из ключа слота → читаемая строка."""
     parts = slot_key.split('_')
     if len(parts) >= 4:
-        week_type = "Чёт" if parts[0] == "even" else "Нечёт"
+        week_type = "чёт" if parts[0] == "even" else "нечёт"
         day = parts[1]
         time_str = parts[2]
         date_str = parts[3]
-        return f"{day} {date_str} {time_str} ({week_type})"
+        try:
+            d = datetime.date.fromisoformat(date_str)
+            date_display = d.strftime('%d.%m')
+        except Exception:
+            date_display = date_str
+        return f"{day} {date_display} {time_str} ({week_type})"
     return slot_key
 
 
@@ -190,9 +190,36 @@ def is_user_booked(user_id, slot_key):
 
 def get_user_bookings(user_id):
     return db_execute(
-        "SELECT * FROM bookings WHERE user_id=? ORDER BY timestamp DESC",
+        "SELECT * FROM bookings WHERE user_id=? ORDER BY slot ASC",
         (user_id,), fetch=True
     )
+
+
+def get_user_future_bookings(user_id):
+    """Только будущие записи пользователя."""
+    all_bookings = get_user_bookings(user_id)
+    if not all_bookings:
+        return []
+    
+    now = datetime.datetime.now()
+    future = []
+    for b in all_bookings:
+        # Парсим дату из slot_key
+        parts = b['slot'].split('_')
+        if len(parts) >= 4:
+            try:
+                date_str = parts[3]
+                time_str = parts[2]
+                d = datetime.date.fromisoformat(date_str)
+                hour, minute = map(int, time_str.split(':'))
+                slot_dt = datetime.datetime.combine(d, datetime.time(hour, minute))
+                if slot_dt > now:
+                    future.append(b)
+            except Exception:
+                future.append(b)  # если не удалось распарсить — оставляем
+        else:
+            future.append(b)
+    return future
 
 
 def get_slot_bookings(slot_key):
@@ -262,8 +289,8 @@ def delete_message_later(peer_id, message_id, delay=DELETE_DELAY):
 def send_auto(peer_id, text, keyboard=None, delay=DELETE_DELAY):
     """
     Отправляет сообщение.
-    Предыдущее сообщение бота в этом чате ставится на удаление.
-    Текущее (последнее) НЕ удаляется.
+    Предыдущее сообщение бота удаляется.
+    Последнее (текущее) остаётся.
     """
     msg_id = send_message(peer_id, text, keyboard)
     if msg_id is None:
@@ -273,7 +300,6 @@ def send_auto(peer_id, text, keyboard=None, delay=DELETE_DELAY):
         prev = last_bot_msg.get(peer_id)
         last_bot_msg[peer_id] = msg_id
 
-    # Удаляем ПРЕДЫДУЩЕЕ сообщение бота, а не текущее
     if prev:
         delete_message_later(peer_id, prev, delay)
 
@@ -296,30 +322,28 @@ def make_main_kb(user_id, is_chat=False):
 
 
 def make_slots_kb():
-    """Кнопки доступных (будущих) слотов + Назад."""
+    """4 кнопки ближайших занятий + Назад."""
     kb = VkKeyboard(one_time=False)
-    available = get_available_slots()
+    slots = get_next_n_slots(SLOTS_TO_SHOW)
 
-    if not available:
-        kb.add_button("Нет доступных слотов", color=VkKeyboardColor.SECONDARY)
+    if not slots:
+        kb.add_button("Нет доступных занятий", color=VkKeyboardColor.SECONDARY)
         kb.add_line()
         kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
         return kb.get_keyboard()
 
-    for i, slot_info in enumerate(available):
-        day = slot_info['day']
-        t = slot_info['time']
-        date_str = slot_info['date'].strftime('%d.%m')
-        slot_key = make_slot_key(slot_info)
-        count = count_booked(slot_key)
+    for i, s in enumerate(slots):
+        date_str = s['date'].strftime('%d.%m')
+        count = count_booked(s['slot_key'])
+        parity = "чёт" if s['parity'] == "even" else "нечёт"
 
-        label = f"{day} {date_str} {t} [{count}/{MAX_PER_SLOT}]"
+        label = f"{s['day']} {date_str} {s['time']} [{count}/{MAX_PER_SLOT}]"
         if len(label) > 40:
             label = label[:40]
 
         color = VkKeyboardColor.PRIMARY if count < MAX_PER_SLOT else VkKeyboardColor.SECONDARY
         kb.add_button(label, color=color)
-        if i < len(available) - 1:
+        if i < len(slots) - 1:
             kb.add_line()
 
     kb.add_line()
@@ -361,27 +385,24 @@ def make_admin_kb():
 
 def make_admin_slots_kb():
     kb = VkKeyboard(one_time=False)
-    available = get_available_slots()
+    slots = get_next_n_slots(SLOTS_TO_SHOW)
 
-    if not available:
+    if not slots:
         kb.add_button("Нет слотов", color=VkKeyboardColor.SECONDARY)
         kb.add_line()
         kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
         return kb.get_keyboard()
 
-    for i, slot_info in enumerate(available):
-        day = slot_info['day']
-        t = slot_info['time']
-        date_str = slot_info['date'].strftime('%d.%m')
-        slot_key = make_slot_key(slot_info)
-        count = count_booked(slot_key)
+    for i, s in enumerate(slots):
+        date_str = s['date'].strftime('%d.%m')
+        count = count_booked(s['slot_key'])
 
-        label = f"A:{day} {date_str} {t} [{count}]"
+        label = f"A:{s['day']} {date_str} {s['time']} [{count}]"
         if len(label) > 40:
             label = label[:40]
 
         kb.add_button(label, color=VkKeyboardColor.PRIMARY)
-        if i < len(available) - 1:
+        if i < len(slots) - 1:
             kb.add_line()
 
     kb.add_line()
@@ -400,7 +421,6 @@ def make_admin_slot_actions_kb():
 
 
 def make_user_slots_select_kb(bookings):
-    """Клавиатура выбора своего слота (для тем/удаления)."""
     kb = VkKeyboard(one_time=False)
     for i, b in enumerate(bookings):
         display = parse_slot_display(b['slot'])
@@ -434,7 +454,7 @@ def clear_state(user_id):
 # ==================== SLOT PARSING ====================
 def parse_slot_from_button(text):
     """
-    Парсит кнопку вида 'Пн 15.01 16:00 [3/10]' или 'A:Пн 15.01 16:00 [3]'
+    Парсит кнопку: 'Пн 15.01 16:00 [3/10]' или 'A:Пн 15.01 16:00 [3]'
     Возвращает slot_key или None.
     """
     try:
@@ -446,17 +466,21 @@ def parse_slot_from_button(text):
         if len(parts) < 3:
             return None
 
-        day = parts[0]       # 'Пн'
-        date_short = parts[1]  # '15.01'
-        time_str = parts[2]  # '16:00'
+        day = parts[0]
+        date_short = parts[1]
+        time_str = parts[2]
 
         now = datetime.datetime.now()
-        year = now.year
         day_num, month_num = date_short.split('.')
+        
+        # Определяем год: если месяц меньше текущего — следующий год
+        year = now.year
+        if int(month_num) < now.month - 1:
+            year += 1
+        
         slot_date = datetime.date(year, int(month_num), int(day_num))
-
-        week_type = get_current_week_type()
-        slot_key = f"{week_type}_{day}_{time_str}_{slot_date.isoformat()}"
+        parity = get_week_parity(slot_date)
+        slot_key = f"{parity}_{day}_{time_str}_{slot_date.isoformat()}"
         return slot_key
 
     except Exception as e:
@@ -466,11 +490,11 @@ def parse_slot_from_button(text):
 
 # ==================== ОБРАБОТЧИКИ ====================
 def handle_main_menu(peer_id, user_id, is_chat=False):
-    bookings = get_user_bookings(user_id)
+    bookings = get_user_future_bookings(user_id)
     text = "👋 Привет! Я бот для записи на занятия.\n"
 
     if bookings:
-        text += "\n📌 Ваши записи:\n"
+        text += "\n📌 Ваши ближайшие записи:\n"
         for b in bookings:
             display = parse_slot_display(b['slot'])
             text += f"  • {display}\n"
@@ -484,13 +508,14 @@ def handle_main_menu(peer_id, user_id, is_chat=False):
 
 
 def handle_record_menu(peer_id, user_id):
-    available = get_available_slots()
-    week_type = "Чётная" if is_even_week() else "Нечётная"
+    slots = get_next_n_slots(SLOTS_TO_SHOW)
 
-    if not available:
-        text = f"📅 Неделя: {week_type}\n❌ Все слоты на этой неделе уже прошли."
+    if not slots:
+        text = "📅 Нет доступных занятий в ближайшее время."
     else:
-        text = f"📅 Неделя: {week_type}\nВыберите слот (макс {MAX_PER_SLOT} чел.):"
+        text = f"📅 Ближайшие {len(slots)} занятий:\n"
+        text += f"(макс {MAX_PER_SLOT} чел. на занятие)\n"
+        text += "Выберите слот:"
 
     kb = make_slots_kb()
     send_auto(peer_id, text, kb)
@@ -498,9 +523,9 @@ def handle_record_menu(peer_id, user_id):
 
 
 def handle_my_records(peer_id, user_id):
-    bookings = get_user_bookings(user_id)
+    bookings = get_user_future_bookings(user_id)
     if not bookings:
-        text = "📋 У вас нет записей."
+        text = "📋 У вас нет предстоящих записей."
     else:
         text = "📋 Ваши записи:\n"
         for i, b in enumerate(bookings, 1):
@@ -513,8 +538,8 @@ def handle_my_records(peer_id, user_id):
 
 
 def handle_slot_booking(peer_id, user_id, text):
-    if text == "Нет доступных слотов":
-        send_auto(peer_id, "❌ Слотов нет. Ждите следующей недели.")
+    if text == "Нет доступных занятий":
+        send_auto(peer_id, "❌ Занятий нет.")
         return
 
     slot_key = parse_slot_from_button(text)
@@ -523,12 +548,16 @@ def handle_slot_booking(peer_id, user_id, text):
         return
 
     if is_user_booked(user_id, slot_key):
-        send_auto(peer_id, "⚠ Вы уже записаны на этот слот!")
+        send_auto(peer_id, "⚠ Вы уже записаны на это занятие!")
+        time.sleep(1)
+        handle_record_menu(peer_id, user_id)
         return
 
     count = count_booked(slot_key)
     if count >= MAX_PER_SLOT:
-        send_auto(peer_id, "⚠ Слот заполнен! Выберите другой.")
+        send_auto(peer_id, "⚠ Занятие заполнено! Выберите другое.")
+        time.sleep(1)
+        handle_record_menu(peer_id, user_id)
         return
 
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -541,7 +570,7 @@ def handle_slot_booking(peer_id, user_id, text):
     msg = f"✅ Вы записаны на {display}\n📅 Дата записи: {now_str}"
     send_auto(peer_id, msg)
 
-    time.sleep(1)
+    time.sleep(1.5)
     handle_record_menu(peer_id, user_id)
 
 
@@ -553,8 +582,7 @@ def handle_feedback_input(peer_id, user_id):
 
 
 def handle_suggest_theme_select(peer_id, user_id):
-    """Выбор занятия, к которому предложить тему."""
-    bookings = get_user_bookings(user_id)
+    bookings = get_user_future_bookings(user_id)
     if not bookings:
         send_auto(peer_id, "⚠ У вас нет записей.")
         time.sleep(1)
@@ -562,7 +590,6 @@ def handle_suggest_theme_select(peer_id, user_id):
         return
 
     if len(bookings) == 1:
-        # Одна запись — сразу к вводу тем
         slot_key = bookings[0]['slot']
         start_theme_input(peer_id, user_id, slot_key)
         return
@@ -585,7 +612,7 @@ def start_theme_input(peer_id, user_id, slot_key):
 
 
 def handle_delete_record_menu(peer_id, user_id):
-    bookings = get_user_bookings(user_id)
+    bookings = get_user_future_bookings(user_id)
     if not bookings:
         send_auto(peer_id, "📋 Нет записей для удаления.")
         time.sleep(1)
@@ -615,8 +642,9 @@ def handle_admin_menu(peer_id, user_id):
 
 
 def handle_admin_records(peer_id, user_id):
-    week_type = "Чётная" if is_even_week() else "Нечётная"
-    text = f"📊 Записи (неделя: {week_type}).\nВыберите слот:"
+    slots = get_next_n_slots(SLOTS_TO_SHOW)
+    count = len(slots)
+    text = f"📊 Ближайшие {count} занятий.\nВыберите слот:"
     kb = make_admin_slots_kb()
     send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_records_select', {'peer_id': peer_id})
@@ -635,7 +663,7 @@ def handle_admin_slot_view(peer_id, user_id, text_btn):
     text = f"📊 {display}\n\n"
 
     if not bookings:
-        text += "Записей нет.\n"
+        text += "👥 Записей нет.\n"
     else:
         text += f"👥 Записанные ({len(bookings)}/{MAX_PER_SLOT}):\n"
         for i, b in enumerate(bookings, 1):
@@ -783,8 +811,9 @@ def process_message(peer_id, from_id, text, is_chat=False):
     # ---- THEME SELECT SLOT ----
     if state == 'theme_select_slot':
         bookings = data.get('bookings', [])
-        # Пробуем по номеру кнопки
         selected_slot = None
+
+        # По тексту кнопки
         for i, b in enumerate(bookings):
             display = parse_slot_display(b['slot'])
             label = f"{i + 1}. {display}"
@@ -792,8 +821,8 @@ def process_message(peer_id, from_id, text, is_chat=False):
                 selected_slot = b['slot']
                 break
 
+        # По номеру
         if not selected_slot:
-            # Пробуем как число
             try:
                 num = int(text)
                 if 1 <= num <= len(bookings):
@@ -822,7 +851,8 @@ def process_message(peer_id, from_id, text, is_chat=False):
                 (user_id, slot_key, text)
             )
             display = parse_slot_display(slot_key)
-            send_auto(peer_id, f"📝 Тема сохранена для {display}!\nПродолжайте или «🛑 Стоп».",
+            send_auto(peer_id,
+                       f"📝 Тема сохранена для {display}!\nПродолжайте или «🛑 Стоп».",
                        make_stop_kb())
         else:
             send_auto(peer_id, "⚠ Ошибка: слот не найден.")
@@ -909,8 +939,9 @@ def process_message(peer_id, from_id, text, is_chat=False):
 
     # ---- ADMIN THEMES VIEW ----
     if state == 'admin_themes_view':
-        handle_admin_slot_view(peer_id, user_id,
-                                f"A:{data.get('slot_key', '')}")
+        slot_key = data.get('slot_key', '')
+        # Возвращаемся к просмотру слота
+        handle_admin_slot_view(peer_id, user_id, f"A:x {slot_key}")
         return
 
     # ---- ADMIN FEEDBACK VIEW ----
@@ -966,11 +997,14 @@ if __name__ == '__main__':
     now = datetime.datetime.now()
     print(f"Time: {now}")
     print(f"ISO week: {now.isocalendar()[1]}")
-    print(f"Week type: {'Even' if is_even_week() else 'Odd'}")
+    print(f"Week parity: {'even' if is_even_week() else 'odd'}")
     print(f"Admins: {ADMINS}")
-    print(f"Available slots: {len(get_available_slots())}")
-    for s in get_available_slots():
-        print(f"  {s['day']} {s['date']} {s['time']}")
+
+    upcoming = get_next_n_slots(SLOTS_TO_SHOW)
+    print(f"Next {SLOTS_TO_SHOW} slots:")
+    for s in upcoming:
+        print(f"  {s['day']} {s['date']} {s['time']} ({s['parity']})")
+
     print("=" * 50)
 
     init_db()
