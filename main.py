@@ -19,7 +19,8 @@ ADMINS = [408937441, 576380600, 506670282, 516249502, 505314801]  # VK user IDs 
 
 DB_PATH = 'bot.db'
 MAX_PER_SLOT = 10
-DELETE_DELAY = 8  # секунд до удаления сообщений бота
+DELETE_DELAY = 8
+SLOTS_TO_SHOW = 4  # сколько ближайших занятий показывать
 
 # ==================== РАСПИСАНИЕ ====================
 # weekday: 0=Пн, 1=Вт, 2=Ср, 3=Чт, 4=Пт, 5=Сб, 6=Вс
@@ -1016,3 +1017,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"[FLASK] Starting on port {port}")
     app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port)
+
