@@ -288,22 +288,7 @@ def delete_message_later(peer_id, message_id, delay=DELETE_DELAY):
 
 
 def send_auto(peer_id, text, keyboard=None, delay=DELETE_DELAY):
-    """
-    Отправляет сообщение.
-    Предыдущее сообщение бота удаляется.
-    Последнее (текущее) остаётся.
-    """
     msg_id = send_message(peer_id, text, keyboard)
-    if msg_id is None:
-        return None
-
-    with last_bot_msg_lock:
-        prev = last_bot_msg.get(peer_id)
-        last_bot_msg[peer_id] = msg_id
-
-    if prev:
-        delete_message_later(peer_id, prev, delay)
-
     return msg_id
 
 
@@ -323,12 +308,12 @@ def make_main_kb(user_id, is_chat=False):
 
 
 def make_slots_kb():
-    """4 кнопки ближайших занятий + Назад."""
+    """4 кнопки ближайших занятий + Назад. По 2 в строке."""
     kb = VkKeyboard(one_time=False)
     slots = get_next_n_slots(SLOTS_TO_SHOW)
 
     if not slots:
-        kb.add_button("Нет доступных занятий", color=VkKeyboardColor.SECONDARY)
+        kb.add_button("Нет занятий", color=VkKeyboardColor.SECONDARY)
         kb.add_line()
         kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
         return kb.get_keyboard()
@@ -336,16 +321,21 @@ def make_slots_kb():
     for i, s in enumerate(slots):
         date_str = s['date'].strftime('%d.%m')
         count = count_booked(s['slot_key'])
-        parity = "чёт" if s['parity'] == "even" else "нечёт"
 
+        # Короткий текст кнопки
         label = f"{s['day']} {date_str} {s['time']} [{count}/{MAX_PER_SLOT}]"
         if len(label) > 40:
-            label = label[:40]
+            label = f"{s['day']} {date_str} {s['time']}"
 
         color = VkKeyboardColor.PRIMARY if count < MAX_PER_SLOT else VkKeyboardColor.SECONDARY
         kb.add_button(label, color=color)
-        if i < len(slots) - 1:
+
+        # Новая строка после каждой ВТОРОЙ кнопки
+        if i % 2 == 1 and i < len(slots) - 1:
             kb.add_line()
+        elif i % 2 == 0 and i == len(slots) - 1:
+            # Последняя кнопка нечётная — переход на новую строку
+            pass
 
     kb.add_line()
     kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
@@ -385,6 +375,7 @@ def make_admin_kb():
 
 
 def make_admin_slots_kb():
+    """4 кнопки слотов для админа. По 2 в строке."""
     kb = VkKeyboard(one_time=False)
     slots = get_next_n_slots(SLOTS_TO_SHOW)
 
@@ -400,26 +391,16 @@ def make_admin_slots_kb():
 
         label = f"A:{s['day']} {date_str} {s['time']} [{count}]"
         if len(label) > 40:
-            label = label[:40]
+            label = f"A:{s['day']} {date_str} [{count}]"
 
         kb.add_button(label, color=VkKeyboardColor.PRIMARY)
-        if i < len(slots) - 1:
+
+        if i % 2 == 1 and i < len(slots) - 1:
             kb.add_line()
 
     kb.add_line()
     kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
     return kb.get_keyboard()
-
-
-def make_admin_slot_actions_kb():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("🗑 Удалить запись", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("📝 Список тем", color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
-    return kb.get_keyboard()
-
 
 def make_user_slots_select_kb(bookings):
     kb = VkKeyboard(one_time=False)
@@ -1018,4 +999,5 @@ if __name__ == '__main__':
     print(f"[FLASK] Starting on port {port}")
     app.run(host='0.0.0.0', port=port)
     app.run(host='0.0.0.0', port=port)
+
 
