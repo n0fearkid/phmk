@@ -16,9 +16,10 @@ GROUP_TOKEN = os.environ.get('GROUP_TOKEN', 'vk1.a.nF-zqzyP2uAJATyhkFxaptOMelXcP
 GROUP_ID = int(os.environ.get('GROUP_ID', '236429857'))
 ADMINS = [408937441, 576380600, 506670282, 516249502, 505314801]  # VK user IDs админов
 
+
 DB_PATH = 'bot.db'
 MAX_PER_SLOT = 10
-DELETE_DELAY = 20  # секунд до удаления своих сообщений
+DELETE_DELAY = 8  # секунд до удаления сообщений бота
 
 # ==================== РАСПИСАНИЕ ====================
 # Четная неделя: Пн 16:00, Пт 16:30, Сб 14:00
@@ -39,6 +40,11 @@ ODD_SLOTS = [
 # ==================== СОСТОЯНИЯ ====================
 user_states = {}
 user_states_lock = threading.Lock()
+
+# Хранит последнее сообщение бота для каждого peer_id
+# чтобы НЕ удалять его (удаляем только предпоследние)
+last_bot_msg = {}
+last_bot_msg_lock = threading.Lock()
 
 # ==================== FLASK ====================
 app = Flask(__name__)
@@ -62,7 +68,6 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         slot TEXT NOT NULL,
-        subgroup INTEGER NOT NULL,
         timestamp TEXT NOT NULL
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS suggestions (
@@ -100,7 +105,6 @@ def db_execute(query, params=(), fetch=False, fetchone=False):
 
 # ==================== SLOT HELPERS ====================
 def is_even_week():
-    """Возвращает True, если текущая неделя четная (ISO week number % 2 == 0)."""
     now = datetime.datetime.now()
     week_num = now.isocalendar()[1]
     return week_num % 2 == 0
@@ -111,96 +115,101 @@ def get_current_week_type():
 
 
 def get_current_slots():
-    """Возвращает список слотов для текущей недели."""
     if is_even_week():
         return EVEN_SLOTS
     else:
         return ODD_SLOTS
 
 
-def get_slot_dates():
+def get_available_slots():
     """
-    Возвращает словарь с полными датами для каждого слота текущей недели.
-    Ключ: "day_time" (напр. "Пн_16:00"), значение: дата (datetime.date).
+    Возвращает только БУДУЩИЕ слоты текущей недели.
+    Прошедшие даты/время отфильтровываются.
     """
     now = datetime.datetime.now()
     today = now.date()
-    current_weekday = today.weekday()  # 0=Пн, 6=Вс
+    current_weekday = today.weekday()
 
     slots = get_current_slots()
     result = []
     for slot in slots:
         diff = slot["weekday"] - current_weekday
         slot_date = today + datetime.timedelta(days=diff)
+
+        # Парсим время слота
+        hour, minute = map(int, slot["time"].split(':'))
+        slot_datetime = datetime.datetime.combine(slot_date, datetime.time(hour, minute))
+
+        # Пропускаем прошедшие
+        if slot_datetime < now:
+            continue
+
         result.append({
             "day": slot["day"],
             "time": slot["time"],
             "weekday": slot["weekday"],
             "date": slot_date,
+            "datetime": slot_datetime,
         })
     return result
 
 
-def make_slot_key(slot_info, subgroup):
-    """Создает уникальный ключ слота: 'even_Пн_16:00_2024-01-15'"""
+def make_slot_key(slot_info):
+    """Ключ слота: 'even_Пн_16:00_2025-01-15'"""
     week_type = get_current_week_type()
     return f"{week_type}_{slot_info['day']}_{slot_info['time']}_{slot_info['date'].isoformat()}"
 
 
-def make_slot_key_full(slot_info, subgroup):
-    """Полный ключ с подгруппой: 'even_Пн_16:00_2024-01-15_1'"""
-    base = make_slot_key(slot_info, subgroup)
-    return f"{base}_{subgroup}"
-
-
-def parse_slot_display(slot_key, subgroup):
-    """Из ключа слота делает читаемую строку."""
+def parse_slot_display(slot_key):
+    """Из ключа слота → читаемая строка."""
     parts = slot_key.split('_')
-    # even_Пн_16:00_2024-01-15
     if len(parts) >= 4:
         week_type = "Чёт" if parts[0] == "even" else "Нечёт"
         day = parts[1]
         time_str = parts[2]
         date_str = parts[3]
-        return f"{day} {date_str} {time_str} Подгр{subgroup} ({week_type})"
-    return f"{slot_key} Подгр{subgroup}"
+        return f"{day} {date_str} {time_str} ({week_type})"
+    return slot_key
 
 
-def count_booked(slot_key, subgroup):
-    """Считает количество записанных на слот+подгруппу."""
+def count_booked(slot_key):
     row = db_execute(
-        "SELECT COUNT(*) as cnt FROM bookings WHERE slot=? AND subgroup=?",
-        (slot_key, subgroup), fetchone=True
+        "SELECT COUNT(*) as cnt FROM bookings WHERE slot=?",
+        (slot_key,), fetchone=True
     )
     return row['cnt'] if row else 0
 
 
-def is_user_booked(user_id, slot_key, subgroup):
-    """Проверяет, записан ли юзер на слот."""
+def is_user_booked(user_id, slot_key):
     row = db_execute(
-        "SELECT id FROM bookings WHERE user_id=? AND slot=? AND subgroup=?",
-        (user_id, slot_key, subgroup), fetchone=True
+        "SELECT id FROM bookings WHERE user_id=? AND slot=?",
+        (user_id, slot_key), fetchone=True
     )
     return row is not None
 
 
 def get_user_bookings(user_id):
-    """Возвращает все записи юзера."""
     return db_execute(
         "SELECT * FROM bookings WHERE user_id=? ORDER BY timestamp DESC",
         (user_id,), fetch=True
     )
 
 
-def get_slot_bookings(slot_key, subgroup):
-    """Возвращает все записи на слот."""
+def get_slot_bookings(slot_key):
     return db_execute(
-        "SELECT * FROM bookings WHERE slot=? AND subgroup=? ORDER BY id",
-        (slot_key, subgroup), fetch=True
+        "SELECT * FROM bookings WHERE slot=? ORDER BY id",
+        (slot_key,), fetch=True
     )
 
 
-# ==================== VK API HELPERS ====================
+def get_slot_themes(slot_key):
+    return db_execute(
+        "SELECT * FROM suggestions WHERE slot=? ORDER BY id",
+        (slot_key,), fetch=True
+    )
+
+
+# ==================== VK API ====================
 vk_session = None
 vk = None
 longpoll = None
@@ -215,7 +224,6 @@ def init_vk():
 
 
 def send_message(peer_id, text, keyboard=None):
-    """Отправляет сообщение и возвращает message_id."""
     try:
         params = {
             'peer_id': peer_id,
@@ -225,7 +233,7 @@ def send_message(peer_id, text, keyboard=None):
         if keyboard:
             params['keyboard'] = keyboard
         result = vk.messages.send(**params)
-        print(f"[SEND] peer={peer_id}, msg_id={result}, text={text[:50]}...")
+        print(f"[SEND] peer={peer_id}, msg_id={result}")
         return result
     except Exception as e:
         print(f"[ERROR] send_message: {e}")
@@ -234,11 +242,9 @@ def send_message(peer_id, text, keyboard=None):
 
 
 def delete_message_later(peer_id, message_id, delay=DELETE_DELAY):
-    """Удаляет сообщение бота через delay секунд в отдельном потоке."""
     def _delete():
         time.sleep(delay)
         try:
-            # Для бесед используем delete_for_all
             vk.messages.delete(
                 peer_id=peer_id,
                 message_ids=message_id,
@@ -247,17 +253,30 @@ def delete_message_later(peer_id, message_id, delay=DELETE_DELAY):
             )
             print(f"[DELETE] peer={peer_id}, msg_id={message_id}")
         except Exception as e:
-            print(f"[DELETE ERROR] peer={peer_id}, msg_id={message_id}: {e}")
+            print(f"[DELETE ERR] {e}")
 
     t = threading.Thread(target=_delete, daemon=True)
     t.start()
 
 
-def send_and_delete(peer_id, text, keyboard=None, delay=DELETE_DELAY):
-    """Отправляет сообщение и ставит на удаление."""
+def send_auto(peer_id, text, keyboard=None, delay=DELETE_DELAY):
+    """
+    Отправляет сообщение.
+    Предыдущее сообщение бота в этом чате ставится на удаление.
+    Текущее (последнее) НЕ удаляется.
+    """
     msg_id = send_message(peer_id, text, keyboard)
-    if msg_id:
-        delete_message_later(peer_id, msg_id, delay)
+    if msg_id is None:
+        return None
+
+    with last_bot_msg_lock:
+        prev = last_bot_msg.get(peer_id)
+        last_bot_msg[peer_id] = msg_id
+
+    # Удаляем ПРЕДЫДУЩЕЕ сообщение бота, а не текущее
+    if prev:
+        delete_message_later(peer_id, prev, delay)
+
     return msg_id
 
 
@@ -277,29 +296,30 @@ def make_main_kb(user_id, is_chat=False):
 
 
 def make_slots_kb():
-    """Клавиатура с 6 кнопками (3 дня x 2 подгруппы) + Назад."""
+    """Кнопки доступных (будущих) слотов + Назад."""
     kb = VkKeyboard(one_time=False)
-    slot_dates = get_slot_dates()
+    available = get_available_slots()
 
-    for i, slot_info in enumerate(slot_dates):
+    if not available:
+        kb.add_button("Нет доступных слотов", color=VkKeyboardColor.SECONDARY)
+        kb.add_line()
+        kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
+        return kb.get_keyboard()
+
+    for i, slot_info in enumerate(available):
         day = slot_info['day']
         t = slot_info['time']
         date_str = slot_info['date'].strftime('%d.%m')
-        count1 = count_booked(make_slot_key(slot_info, 1), 1)
-        count2 = count_booked(make_slot_key(slot_info, 2), 2)
+        slot_key = make_slot_key(slot_info)
+        count = count_booked(slot_key)
 
-        label1 = f"{day} {date_str} {t} П1 [{count1}/{MAX_PER_SLOT}]"
-        label2 = f"{day} {date_str} {t} П2 [{count2}/{MAX_PER_SLOT}]"
+        label = f"{day} {date_str} {t} [{count}/{MAX_PER_SLOT}]"
+        if len(label) > 40:
+            label = label[:40]
 
-        # Ограничение длины кнопки VK - 40 символов
-        if len(label1) > 40:
-            label1 = label1[:40]
-        if len(label2) > 40:
-            label2 = label2[:40]
-
-        kb.add_button(label1, color=VkKeyboardColor.PRIMARY)
-        kb.add_button(label2, color=VkKeyboardColor.PRIMARY)
-        if i < len(slot_dates) - 1:
+        color = VkKeyboardColor.PRIMARY if count < MAX_PER_SLOT else VkKeyboardColor.SECONDARY
+        kb.add_button(label, color=color)
+        if i < len(available) - 1:
             kb.add_line()
 
     kb.add_line()
@@ -323,6 +343,12 @@ def make_back_kb():
     return kb.get_keyboard()
 
 
+def make_stop_kb():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("🛑 Стоп", color=VkKeyboardColor.NEGATIVE)
+    return kb.get_keyboard()
+
+
 def make_admin_kb():
     kb = VkKeyboard(one_time=False)
     kb.add_button("📊 Записи", color=VkKeyboardColor.PRIMARY)
@@ -334,28 +360,28 @@ def make_admin_kb():
 
 
 def make_admin_slots_kb():
-    """Клавиатура слотов для админа."""
     kb = VkKeyboard(one_time=False)
-    slot_dates = get_slot_dates()
+    available = get_available_slots()
 
-    for i, slot_info in enumerate(slot_dates):
+    if not available:
+        kb.add_button("Нет слотов", color=VkKeyboardColor.SECONDARY)
+        kb.add_line()
+        kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
+        return kb.get_keyboard()
+
+    for i, slot_info in enumerate(available):
         day = slot_info['day']
         t = slot_info['time']
         date_str = slot_info['date'].strftime('%d.%m')
-        count1 = count_booked(make_slot_key(slot_info, 1), 1)
-        count2 = count_booked(make_slot_key(slot_info, 2), 2)
+        slot_key = make_slot_key(slot_info)
+        count = count_booked(slot_key)
 
-        label1 = f"A:{day} {date_str} {t} П1 [{count1}]"
-        label2 = f"A:{day} {date_str} {t} П2 [{count2}]"
+        label = f"A:{day} {date_str} {t} [{count}]"
+        if len(label) > 40:
+            label = label[:40]
 
-        if len(label1) > 40:
-            label1 = label1[:40]
-        if len(label2) > 40:
-            label2 = label2[:40]
-
-        kb.add_button(label1, color=VkKeyboardColor.PRIMARY)
-        kb.add_button(label2, color=VkKeyboardColor.PRIMARY)
-        if i < len(slot_dates) - 1:
+        kb.add_button(label, color=VkKeyboardColor.PRIMARY)
+        if i < len(available) - 1:
             kb.add_line()
 
     kb.add_line()
@@ -373,13 +399,23 @@ def make_admin_slot_actions_kb():
     return kb.get_keyboard()
 
 
-def make_stop_kb():
+def make_user_slots_select_kb(bookings):
+    """Клавиатура выбора своего слота (для тем/удаления)."""
     kb = VkKeyboard(one_time=False)
-    kb.add_button("🛑 Стоп", color=VkKeyboardColor.NEGATIVE)
+    for i, b in enumerate(bookings):
+        display = parse_slot_display(b['slot'])
+        label = f"{i + 1}. {display}"
+        if len(label) > 40:
+            label = label[:40]
+        kb.add_button(label, color=VkKeyboardColor.PRIMARY)
+        if i < len(bookings) - 1:
+            kb.add_line()
+    kb.add_line()
+    kb.add_button("⬅ Назад", color=VkKeyboardColor.SECONDARY)
     return kb.get_keyboard()
 
 
-# ==================== STATE MANAGEMENT ====================
+# ==================== STATE ====================
 def get_state(user_id):
     with user_states_lock:
         return user_states.get(user_id, {'state': 'main', 'data': {}})
@@ -398,28 +434,22 @@ def clear_state(user_id):
 # ==================== SLOT PARSING ====================
 def parse_slot_from_button(text):
     """
-    Парсит текст кнопки слота, возвращает (slot_key, subgroup) или None.
-    Формат: "Пн 15.01 16:00 П1 [3/10]" или "A:Пн 15.01 16:00 П1 [3]"
+    Парсит кнопку вида 'Пн 15.01 16:00 [3/10]' или 'A:Пн 15.01 16:00 [3]'
+    Возвращает slot_key или None.
     """
     try:
         clean = text.strip()
-        is_admin = clean.startswith("A:")
-        if is_admin:
+        if clean.startswith("A:"):
             clean = clean[2:]
 
         parts = clean.split()
-        # parts: ['Пн', '15.01', '16:00', 'П1', '[3/10]'] или ['Пн', '15.01', '16:00', 'П2', '[3]']
-        if len(parts) < 4:
+        if len(parts) < 3:
             return None
 
-        day = parts[0]
+        day = parts[0]       # 'Пн'
         date_short = parts[1]  # '15.01'
         time_str = parts[2]  # '16:00'
-        subgroup_str = parts[3]  # 'П1' или 'П2'
 
-        subgroup = int(subgroup_str.replace('П', ''))
-
-        # Определяем полную дату
         now = datetime.datetime.now()
         year = now.year
         day_num, month_num = date_short.split('.')
@@ -427,136 +457,152 @@ def parse_slot_from_button(text):
 
         week_type = get_current_week_type()
         slot_key = f"{week_type}_{day}_{time_str}_{slot_date.isoformat()}"
-
-        return slot_key, subgroup
+        return slot_key
 
     except Exception as e:
-        print(f"[PARSE ERROR] '{text}': {e}")
+        print(f"[PARSE ERR] '{text}': {e}")
         return None
 
 
 # ==================== ОБРАБОТЧИКИ ====================
 def handle_main_menu(peer_id, user_id, is_chat=False):
-    """Показывает главное меню."""
     bookings = get_user_bookings(user_id)
-    greeting = "👋 Привет! Я бот для записи на занятия.\n"
+    text = "👋 Привет! Я бот для записи на занятия.\n"
 
     if bookings:
-        greeting += "\n📌 Ваши текущие записи:\n"
+        text += "\n📌 Ваши записи:\n"
         for b in bookings:
-            display = parse_slot_display(b['slot'], b['subgroup'])
-            greeting += f"  • {display}\n"
+            display = parse_slot_display(b['slot'])
+            text += f"  • {display}\n"
     else:
-        greeting += "\nУ вас пока нет записей.\n"
+        text += "\nУ вас пока нет записей.\n"
 
-    greeting += "\nВыберите действие:"
+    text += "\nВыберите действие:"
     kb = make_main_kb(user_id, is_chat)
-    send_and_delete(peer_id, greeting, kb, delay=DELETE_DELAY)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'main', {'peer_id': peer_id, 'is_chat': is_chat})
 
 
 def handle_record_menu(peer_id, user_id):
-    """Показывает меню записи со слотами."""
+    available = get_available_slots()
     week_type = "Чётная" if is_even_week() else "Нечётная"
-    text = f"📅 Текущая неделя: {week_type}\n"
-    text += f"Выберите слот для записи (макс {MAX_PER_SLOT} чел.):"
+
+    if not available:
+        text = f"📅 Неделя: {week_type}\n❌ Все слоты на этой неделе уже прошли."
+    else:
+        text = f"📅 Неделя: {week_type}\nВыберите слот (макс {MAX_PER_SLOT} чел.):"
+
     kb = make_slots_kb()
-    send_and_delete(peer_id, text, kb, delay=DELETE_DELAY)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'record_select', {'peer_id': peer_id})
 
 
 def handle_my_records(peer_id, user_id):
-    """Показывает записи юзера."""
     bookings = get_user_bookings(user_id)
     if not bookings:
         text = "📋 У вас нет записей."
     else:
         text = "📋 Ваши записи:\n"
         for i, b in enumerate(bookings, 1):
-            display = parse_slot_display(b['slot'], b['subgroup'])
+            display = parse_slot_display(b['slot'])
             text += f"  {i}. {display} (записан {b['timestamp']})\n"
 
     kb = make_my_records_kb()
-    send_and_delete(peer_id, text, kb, delay=DELETE_DELAY)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'my_records', {'peer_id': peer_id})
 
 
 def handle_slot_booking(peer_id, user_id, text):
-    """Обработка выбора слота для записи."""
-    parsed = parse_slot_from_button(text)
-    if not parsed:
-        send_and_delete(peer_id, "⚠ Не удалось распознать слот. Попробуйте ещё раз.", delay=10)
+    if text == "Нет доступных слотов":
+        send_auto(peer_id, "❌ Слотов нет. Ждите следующей недели.")
         return
 
-    slot_key, subgroup = parsed
-
-    # Проверяем, не записан ли уже
-    if is_user_booked(user_id, slot_key, subgroup):
-        send_and_delete(peer_id, "⚠ Вы уже записаны на этот слот!", delay=10)
+    slot_key = parse_slot_from_button(text)
+    if not slot_key:
+        send_auto(peer_id, "⚠ Не удалось распознать слот.")
         return
 
-    # Проверяем лимит
-    count = count_booked(slot_key, subgroup)
+    if is_user_booked(user_id, slot_key):
+        send_auto(peer_id, "⚠ Вы уже записаны на этот слот!")
+        return
+
+    count = count_booked(slot_key)
     if count >= MAX_PER_SLOT:
-        send_and_delete(peer_id, "⚠ Слот заполнен! Выберите другой.", delay=10)
+        send_auto(peer_id, "⚠ Слот заполнен! Выберите другой.")
         return
 
-    # Записываем
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db_execute(
-        "INSERT INTO bookings (user_id, slot, subgroup, timestamp) VALUES (?, ?, ?, ?)",
-        (user_id, slot_key, subgroup, now_str)
+        "INSERT INTO bookings (user_id, slot, timestamp) VALUES (?, ?, ?)",
+        (user_id, slot_key, now_str)
     )
 
-    display = parse_slot_display(slot_key, subgroup)
+    display = parse_slot_display(slot_key)
     msg = f"✅ Вы записаны на {display}\n📅 Дата записи: {now_str}"
-    send_and_delete(peer_id, msg, delay=DELETE_DELAY)
+    send_auto(peer_id, msg)
 
-    # Обновляем меню записи
     time.sleep(1)
     handle_record_menu(peer_id, user_id)
 
 
 def handle_feedback_input(peer_id, user_id):
-    """Начинает прием фидбека."""
-    text = "💬 Напишите ваше мнение/предложение.\nОтправьте текст или нажмите «Назад»."
+    text = "💬 Напишите ваше мнение/предложение.\nИли нажмите «Назад»."
     kb = make_back_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'wait_feedback', {'peer_id': peer_id})
 
 
-def handle_suggest_theme(peer_id, user_id):
-    """Начинает прием тем."""
+def handle_suggest_theme_select(peer_id, user_id):
+    """Выбор занятия, к которому предложить тему."""
     bookings = get_user_bookings(user_id)
     if not bookings:
-        send_and_delete(peer_id, "⚠ У вас нет записей, чтобы предложить тему.", delay=10)
-        return
-
-    text = "💡 Напишите темы для занятий.\nКаждое сообщение — одна тема.\nНажмите «🛑 Стоп» для выхода."
-    kb = make_stop_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
-    set_state(user_id, 'wait_theme', {'peer_id': peer_id})
-
-
-def handle_delete_record_menu(peer_id, user_id):
-    """Показывает список записей для удаления."""
-    bookings = get_user_bookings(user_id)
-    if not bookings:
-        send_and_delete(peer_id, "📋 У вас нет записей для удаления.", delay=10)
+        send_auto(peer_id, "⚠ У вас нет записей.")
+        time.sleep(1)
         handle_my_records(peer_id, user_id)
         return
 
-    text = "❌ Выберите номер записи для удаления:\n"
+    if len(bookings) == 1:
+        # Одна запись — сразу к вводу тем
+        slot_key = bookings[0]['slot']
+        start_theme_input(peer_id, user_id, slot_key)
+        return
+
+    text = "💡 Выберите занятие для предложения темы:"
+    kb = make_user_slots_select_kb(bookings)
+    send_auto(peer_id, text, kb)
+    set_state(user_id, 'theme_select_slot', {
+        'peer_id': peer_id,
+        'bookings': [{'id': b['id'], 'slot': b['slot']} for b in bookings]
+    })
+
+
+def start_theme_input(peer_id, user_id, slot_key):
+    display = parse_slot_display(slot_key)
+    text = f"💡 Занятие: {display}\n\nПишите темы — каждое сообщение = одна тема.\nНажмите «🛑 Стоп» для выхода."
+    kb = make_stop_kb()
+    send_auto(peer_id, text, kb)
+    set_state(user_id, 'wait_theme', {'peer_id': peer_id, 'slot_key': slot_key})
+
+
+def handle_delete_record_menu(peer_id, user_id):
+    bookings = get_user_bookings(user_id)
+    if not bookings:
+        send_auto(peer_id, "📋 Нет записей для удаления.")
+        time.sleep(1)
+        handle_my_records(peer_id, user_id)
+        return
+
+    text = "❌ Выберите запись для удаления:\n"
     for i, b in enumerate(bookings, 1):
-        display = parse_slot_display(b['slot'], b['subgroup'])
+        display = parse_slot_display(b['slot'])
         text += f"  {i}. {display}\n"
     text += "\nНапишите номер или «Назад»."
 
     kb = make_back_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'wait_delete_num', {
         'peer_id': peer_id,
-        'bookings': [{'id': b['id'], 'slot': b['slot'], 'subgroup': b['subgroup']} for b in bookings]
+        'bookings': [{'id': b['id'], 'slot': b['slot']} for b in bookings]
     })
 
 
@@ -564,7 +610,7 @@ def handle_delete_record_menu(peer_id, user_id):
 def handle_admin_menu(peer_id, user_id):
     text = "🔧 Панель администратора:"
     kb = make_admin_kb()
-    send_and_delete(peer_id, text, kb, delay=DELETE_DELAY)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_main', {'peer_id': peer_id})
 
 
@@ -572,34 +618,41 @@ def handle_admin_records(peer_id, user_id):
     week_type = "Чётная" if is_even_week() else "Нечётная"
     text = f"📊 Записи (неделя: {week_type}).\nВыберите слот:"
     kb = make_admin_slots_kb()
-    send_and_delete(peer_id, text, kb, delay=DELETE_DELAY)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_records_select', {'peer_id': peer_id})
 
 
 def handle_admin_slot_view(peer_id, user_id, text_btn):
-    """Показывает записи на выбранный слот (админ)."""
-    parsed = parse_slot_from_button(text_btn)
-    if not parsed:
-        send_and_delete(peer_id, "⚠ Не удалось распознать слот.", delay=10)
+    slot_key = parse_slot_from_button(text_btn)
+    if not slot_key:
+        send_auto(peer_id, "⚠ Не удалось распознать слот.")
         return
 
-    slot_key, subgroup = parsed
-    bookings = get_slot_bookings(slot_key, subgroup)
+    bookings = get_slot_bookings(slot_key)
+    themes = get_slot_themes(slot_key)
+    display = parse_slot_display(slot_key)
 
-    display = parse_slot_display(slot_key, subgroup)
+    text = f"📊 {display}\n\n"
+
     if not bookings:
-        text = f"📊 {display}\nЗаписей нет."
+        text += "Записей нет.\n"
     else:
-        text = f"📊 {display}\nЗаписанные ({len(bookings)}/{MAX_PER_SLOT}):\n"
+        text += f"👥 Записанные ({len(bookings)}/{MAX_PER_SLOT}):\n"
         for i, b in enumerate(bookings, 1):
-            text += f"  {i}. vk.com/id{b['user_id']} (ID: {b['user_id']})\n"
+            text += f"  {i}. vk.com/id{b['user_id']}\n"
+
+    text += f"\n📝 Темы ({len(themes)}):\n"
+    if not themes:
+        text += "  Тем пока нет.\n"
+    else:
+        for t in themes:
+            text += f"  • {t['theme_text']} (от id{t['user_id']})\n"
 
     kb = make_admin_slot_actions_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_slot_view', {
         'peer_id': peer_id,
         'slot_key': slot_key,
-        'subgroup': subgroup,
         'bookings': [{'id': b['id'], 'user_id': b['user_id']} for b in bookings]
     })
 
@@ -613,10 +666,10 @@ def handle_admin_feedback(peer_id, user_id):
     else:
         text = "📨 Последние фидбеки:\n\n"
         for r in rows:
-            text += f"🔹 ID{r['user_id']} ({r['timestamp']}):\n{r['text']}\n\n"
+            text += f"🔹 id{r['user_id']} ({r['timestamp']}):\n{r['text']}\n\n"
 
     kb = make_back_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_feedback_view', {'peer_id': peer_id})
 
 
@@ -625,10 +678,9 @@ def handle_admin_delete_record(peer_id, user_id):
     data = state.get('data', {})
     bookings = data.get('bookings', [])
     slot_key = data.get('slot_key', '')
-    subgroup = data.get('subgroup', 1)
 
     if not bookings:
-        send_and_delete(peer_id, "Нет записей для удаления.", delay=10)
+        send_auto(peer_id, "Нет записей для удаления.")
         return
 
     text = "Напишите номер записи для удаления:\n"
@@ -636,11 +688,10 @@ def handle_admin_delete_record(peer_id, user_id):
         text += f"  {i}. vk.com/id{b['user_id']}\n"
 
     kb = make_back_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_wait_delete_num', {
         'peer_id': peer_id,
         'slot_key': slot_key,
-        'subgroup': subgroup,
         'bookings': bookings
     })
 
@@ -649,49 +700,59 @@ def handle_admin_themes_list(peer_id, user_id):
     state = get_state(user_id)
     data = state.get('data', {})
     slot_key = data.get('slot_key', '')
-    subgroup = data.get('subgroup', 1)
 
-    rows = db_execute(
-        "SELECT * FROM suggestions WHERE slot=? ORDER BY id",
-        (slot_key,), fetch=True
-    )
+    themes = get_slot_themes(slot_key)
+    display = parse_slot_display(slot_key)
 
-    display = parse_slot_display(slot_key, subgroup)
-    if not rows:
+    if not themes:
         text = f"📝 Темы для {display}:\nТем пока нет."
     else:
         text = f"📝 Темы для {display}:\n\n"
-        for r in rows:
-            text += f"🔹 ID{r['user_id']}: {r['theme_text']}\n"
+        for t in themes:
+            text += f"  • {t['theme_text']} (от id{t['user_id']})\n"
 
     kb = make_back_kb()
-    send_and_delete(peer_id, text, kb, delay=30)
+    send_auto(peer_id, text, kb)
     set_state(user_id, 'admin_themes_view', {
         'peer_id': peer_id,
         'slot_key': slot_key,
-        'subgroup': subgroup,
         'bookings': data.get('bookings', [])
     })
 
 
 # ==================== MAIN HANDLER ====================
 def process_message(peer_id, from_id, text, is_chat=False):
-    """Главный обработчик сообщений."""
     user_id = from_id
     text = text.strip()
     state_info = get_state(user_id)
     state = state_info['state']
     data = state_info.get('data', {})
 
-    print(f"[MSG] user={user_id}, peer={peer_id}, state={state}, text={text[:50]}")
+    print(f"[MSG] user={user_id}, peer={peer_id}, state={state}, text={text[:60]}")
 
-    # Универсальные команды
+    # Универсальный старт
     if text.lower() in ['начать', 'start', 'привет', 'меню', 'начало']:
         handle_main_menu(peer_id, user_id, is_chat)
         return
 
-    # ==================== MAIN STATE ====================
-    if state == 'main' or state == '':
+    # ---- НАЗАД ----
+    if text == "⬅ Назад":
+        if state in ['record_select', 'my_records', 'wait_feedback']:
+            handle_main_menu(peer_id, user_id, is_chat)
+        elif state in ['wait_theme', 'wait_delete_num', 'theme_select_slot']:
+            handle_my_records(peer_id, user_id)
+        elif state == 'admin_main':
+            handle_main_menu(peer_id, user_id, is_chat)
+        elif state in ['admin_records_select', 'admin_feedback_view']:
+            handle_admin_menu(peer_id, user_id)
+        elif state in ['admin_slot_view', 'admin_wait_delete_num', 'admin_themes_view']:
+            handle_admin_records(peer_id, user_id)
+        else:
+            handle_main_menu(peer_id, user_id, is_chat)
+        return
+
+    # ---- MAIN ----
+    if state == 'main':
         if text == "📝 Записаться":
             handle_record_menu(peer_id, user_id)
         elif text == "📋 Мои записи":
@@ -704,101 +765,104 @@ def process_message(peer_id, from_id, text, is_chat=False):
             handle_main_menu(peer_id, user_id, is_chat)
         return
 
-    # ==================== BACK ====================
-    if text == "⬅ Назад":
-        if state in ['record_select', 'my_records', 'wait_feedback']:
-            handle_main_menu(peer_id, user_id, is_chat)
-        elif state in ['wait_theme', 'wait_delete_num']:
-            handle_my_records(peer_id, user_id)
-        elif state in ['admin_main']:
-            handle_main_menu(peer_id, user_id, is_chat)
-        elif state in ['admin_records_select', 'admin_feedback_view']:
-            handle_admin_menu(peer_id, user_id)
-        elif state in ['admin_slot_view', 'admin_wait_delete_num', 'admin_themes_view']:
-            handle_admin_records(peer_id, user_id)
-        else:
-            handle_main_menu(peer_id, user_id, is_chat)
-        return
-
-    # ==================== RECORD SELECT ====================
+    # ---- RECORD SELECT ----
     if state == 'record_select':
         handle_slot_booking(peer_id, user_id, text)
         return
 
-    # ==================== MY RECORDS ====================
+    # ---- MY RECORDS ----
     if state == 'my_records':
         if text == "💡 Предложить тему":
-            handle_suggest_theme(peer_id, user_id)
+            handle_suggest_theme_select(peer_id, user_id)
         elif text == "❌ Удалить запись":
             handle_delete_record_menu(peer_id, user_id)
-        elif text == "📝 Записаться":
-            handle_record_menu(peer_id, user_id)
         else:
             handle_my_records(peer_id, user_id)
         return
 
-    # ==================== WAIT FEEDBACK ====================
+    # ---- THEME SELECT SLOT ----
+    if state == 'theme_select_slot':
+        bookings = data.get('bookings', [])
+        # Пробуем по номеру кнопки
+        selected_slot = None
+        for i, b in enumerate(bookings):
+            display = parse_slot_display(b['slot'])
+            label = f"{i + 1}. {display}"
+            if text.startswith(f"{i + 1}.") or text == label[:40]:
+                selected_slot = b['slot']
+                break
+
+        if not selected_slot:
+            # Пробуем как число
+            try:
+                num = int(text)
+                if 1 <= num <= len(bookings):
+                    selected_slot = bookings[num - 1]['slot']
+            except ValueError:
+                pass
+
+        if selected_slot:
+            start_theme_input(peer_id, user_id, selected_slot)
+        else:
+            send_auto(peer_id, "⚠ Выберите занятие из списка.")
+        return
+
+    # ---- WAIT THEME ----
+    if state == 'wait_theme':
+        if text == "🛑 Стоп" or text.lower() == "стоп":
+            send_auto(peer_id, "✅ Темы сохранены!")
+            time.sleep(1)
+            handle_my_records(peer_id, user_id)
+            return
+
+        slot_key = data.get('slot_key', '')
+        if slot_key:
+            db_execute(
+                "INSERT INTO suggestions (user_id, slot, theme_text) VALUES (?, ?, ?)",
+                (user_id, slot_key, text)
+            )
+            display = parse_slot_display(slot_key)
+            send_auto(peer_id, f"📝 Тема сохранена для {display}!\nПродолжайте или «🛑 Стоп».",
+                       make_stop_kb())
+        else:
+            send_auto(peer_id, "⚠ Ошибка: слот не найден.")
+            handle_my_records(peer_id, user_id)
+        return
+
+    # ---- WAIT FEEDBACK ----
     if state == 'wait_feedback':
-        # Сохраняем фидбек
         now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         db_execute(
             "INSERT INTO feedback (user_id, text, timestamp) VALUES (?, ?, ?)",
             (user_id, text, now_str)
         )
-        send_and_delete(peer_id, "💚 Спасибо! Мы читаем все отзывы!", delay=15)
+        send_auto(peer_id, "💚 Спасибо! Мы читаем все отзывы!")
         time.sleep(1)
         handle_main_menu(peer_id, user_id, is_chat)
         return
 
-    # ==================== WAIT THEME ====================
-    if state == 'wait_theme':
-        if text == "🛑 Стоп" or text.lower() == "стоп":
-            send_and_delete(peer_id, "✅ Темы сохранены!", delay=10)
-            time.sleep(1)
-            handle_my_records(peer_id, user_id)
-            return
-
-        # Сохраняем тему для всех слотов юзера
-        bookings = get_user_bookings(user_id)
-        if bookings:
-            for b in bookings:
-                db_execute(
-                    "INSERT INTO suggestions (user_id, slot, theme_text) VALUES (?, ?, ?)",
-                    (user_id, b['slot'], text)
-                )
-            send_and_delete(peer_id, f"📝 Тема «{text[:50]}» сохранена!", delay=10)
-        else:
-            send_and_delete(peer_id, "⚠ У вас нет записей.", delay=10)
-            handle_my_records(peer_id, user_id)
-        return
-
-    # ==================== WAIT DELETE NUM ====================
+    # ---- WAIT DELETE NUM ----
     if state == 'wait_delete_num':
         try:
             num = int(text)
             bookings_list = data.get('bookings', [])
             if 1 <= num <= len(bookings_list):
                 booking = bookings_list[num - 1]
-                booking_id = booking['id']
-                slot_key = booking['slot']
-
-                # Удаляем запись
-                db_execute("DELETE FROM bookings WHERE id=?", (booking_id,))
-                # Удаляем темы юзера по этому слоту
+                db_execute("DELETE FROM bookings WHERE id=?", (booking['id'],))
                 db_execute(
                     "DELETE FROM suggestions WHERE user_id=? AND slot=?",
-                    (user_id, slot_key)
+                    (user_id, booking['slot'])
                 )
-                send_and_delete(peer_id, "✅ Запись удалена!", delay=10)
+                send_auto(peer_id, "✅ Запись удалена!")
                 time.sleep(1)
                 handle_my_records(peer_id, user_id)
             else:
-                send_and_delete(peer_id, "⚠ Неверный номер. Попробуйте ещё.", delay=10)
+                send_auto(peer_id, "⚠ Неверный номер.")
         except ValueError:
-            send_and_delete(peer_id, "⚠ Введите номер записи.", delay=10)
+            send_auto(peer_id, "⚠ Введите номер записи.")
         return
 
-    # ==================== ADMIN STATES ====================
+    # ---- ADMIN MAIN ----
     if state == 'admin_main':
         if text == "📊 Записи":
             handle_admin_records(peer_id, user_id)
@@ -808,10 +872,15 @@ def process_message(peer_id, from_id, text, is_chat=False):
             handle_admin_menu(peer_id, user_id)
         return
 
+    # ---- ADMIN RECORDS SELECT ----
     if state == 'admin_records_select':
+        if text == "Нет слотов":
+            send_auto(peer_id, "❌ Слотов нет.")
+            return
         handle_admin_slot_view(peer_id, user_id, text)
         return
 
+    # ---- ADMIN SLOT VIEW ----
     if state == 'admin_slot_view':
         if text == "🗑 Удалить запись":
             handle_admin_delete_record(peer_id, user_id)
@@ -821,31 +890,30 @@ def process_message(peer_id, from_id, text, is_chat=False):
             handle_admin_records(peer_id, user_id)
         return
 
+    # ---- ADMIN WAIT DELETE NUM ----
     if state == 'admin_wait_delete_num':
         try:
             num = int(text)
             bookings_list = data.get('bookings', [])
             if 1 <= num <= len(bookings_list):
                 booking = bookings_list[num - 1]
-                booking_id = booking['id']
-                db_execute("DELETE FROM bookings WHERE id=?", (booking_id,))
-                send_and_delete(peer_id, "✅ Запись удалена!", delay=10)
+                db_execute("DELETE FROM bookings WHERE id=?", (booking['id'],))
+                send_auto(peer_id, "✅ Запись удалена!")
                 time.sleep(1)
-                # Обновляем вид слота
-                handle_admin_slot_view(peer_id, user_id,
-                                       f"A:{data.get('slot_key', '')}_{data.get('subgroup', 1)}")
-                # Вернёмся к выбору слотов
                 handle_admin_records(peer_id, user_id)
             else:
-                send_and_delete(peer_id, "⚠ Неверный номер.", delay=10)
+                send_auto(peer_id, "⚠ Неверный номер.")
         except ValueError:
-            send_and_delete(peer_id, "⚠ Введите номер.", delay=10)
+            send_auto(peer_id, "⚠ Введите номер.")
         return
 
+    # ---- ADMIN THEMES VIEW ----
     if state == 'admin_themes_view':
-        handle_admin_records(peer_id, user_id)
+        handle_admin_slot_view(peer_id, user_id,
+                                f"A:{data.get('slot_key', '')}")
         return
 
+    # ---- ADMIN FEEDBACK VIEW ----
     if state == 'admin_feedback_view':
         handle_admin_menu(peer_id, user_id)
         return
@@ -854,9 +922,8 @@ def process_message(peer_id, from_id, text, is_chat=False):
     handle_main_menu(peer_id, user_id, is_chat)
 
 
-# ==================== LONGPOLL WORKER ====================
+# ==================== LONGPOLL ====================
 def longpoll_worker():
-    """Основной цикл обработки событий VK."""
     global longpoll
     print("[LONGPOLL] Starting...")
     while True:
@@ -870,14 +937,11 @@ def longpoll_worker():
                     from_id = msg['from_id']
                     text = msg.get('text', '')
 
-                    # Игнорируем сообщения от групп (from_id < 0)
                     if from_id < 0:
                         continue
 
-                    is_chat = peer_id != from_id  # беседа
-                    # В беседе peer_id > 2000000000
+                    is_chat = peer_id != from_id
 
-                    # Обрабатываем в отдельном потоке чтобы не блокировать longpoll
                     t = threading.Thread(
                         target=process_message,
                         args=(peer_id, from_id, text, is_chat),
@@ -899,20 +963,22 @@ def longpoll_worker():
 if __name__ == '__main__':
     print("=" * 50)
     print("VK Bot Starting...")
+    now = datetime.datetime.now()
+    print(f"Time: {now}")
+    print(f"ISO week: {now.isocalendar()[1]}")
     print(f"Week type: {'Even' if is_even_week() else 'Odd'}")
-    print(f"ISO week: {datetime.datetime.now().isocalendar()[1]}")
     print(f"Admins: {ADMINS}")
+    print(f"Available slots: {len(get_available_slots())}")
+    for s in get_available_slots():
+        print(f"  {s['day']} {s['date']} {s['time']}")
     print("=" * 50)
 
-    # Инициализация
     init_db()
     init_vk()
 
-    # Запуск LongPoll в фоновом потоке
     lp_thread = threading.Thread(target=longpoll_worker, daemon=True)
     lp_thread.start()
 
-    # Запуск Flask (для хостинга — Render/Railway нужен HTTP-порт)
     port = int(os.environ.get('PORT', 5000))
     print(f"[FLASK] Starting on port {port}")
     app.run(host='0.0.0.0', port=port)
